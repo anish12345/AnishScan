@@ -35,7 +35,6 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
       with:
-        repository: 'MRI-Software/MRI.OTA.API'
         fetch-depth: 0
     
     - name: Setup .NET Core
@@ -144,11 +143,11 @@ jobs:
         echo "Using Agent ID: $AGENT_ID"
         echo "agent_id=$AGENT_ID" >> $GITHUB_OUTPUT
         
-        # Create scan request
+        # Create scan request for current repository
         SCAN_REQUEST=$(cat << EOF
         {
-          "repositoryUrl": "https://github.com/MRI-Software/MRI.OTA.API.git",
-          "branch": "main",
+          "repositoryUrl": "https://github.com/${{ github.repository }}.git",
+          "branch": "${{ github.ref_name }}",
           "agentId": "$AGENT_ID"
         }
         EOF
