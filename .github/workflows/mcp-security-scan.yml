@@ -56,6 +56,25 @@ jobs:
       run: |
         pip install semgrep
         semgrep --version
+        echo "Semgrep installation path: $(which semgrep)"
+        
+    - name: Verify Environment Setup
+      run: |
+        echo "Working directory: $(pwd)"
+        echo "Available disk space:"
+        df -h
+        echo "Available memory:"
+        free -h
+        echo "Git status:"
+        git status --porcelain
+        echo "Repository size:"
+        du -sh .
+        echo "Available tools:"
+        which git || echo "git not found"
+        which node || echo "node not found" 
+        which npm || echo "npm not found"
+        which dotnet || echo "dotnet not found"
+        which semgrep || echo "semgrep not found"
     
     - name: Configure MCP Server
       run: |
@@ -95,6 +114,9 @@ jobs:
         cd mcp-server/OWASPScannerAgent
         npm install
         
+        # Create temp directory
+        mkdir -p temp
+        
         # Create .env file
         cat > .env << EOF
         MCP_SERVER_URL=https://localhost:44361
@@ -109,10 +131,27 @@ jobs:
     - name: Start OWASP Scanner Agent
       run: |
         cd mcp-server/OWASPScannerAgent
-        nohup node src/index.js &
+        
+        # Start agent with logging
+        echo "Starting OWASP Scanner Agent..."
+        echo "Current directory: $(pwd)"
+        echo "Environment variables:"
+        cat .env
+        
+        # Start agent in background and capture output
+        nohup node src/index.js > agent.log 2>&1 &
         echo $! > ../scanner-agent.pid
+        
+        # Wait for agent to start
+        sleep 5
+        echo "Agent process ID: $(cat ../scanner-agent.pid)"
+        echo "Agent initial logs:"
+        head -20 agent.log || echo "No logs yet"
+        
         # Wait for agent to register
         sleep 15
+        echo "Agent logs after registration:"
+        tail -20 agent.log || echo "No logs available"
     
     - name: Submit Scan Request
       id: submit-scan
@@ -137,10 +176,10 @@ jobs:
         echo "Using Agent ID: $AGENT_ID"
         echo "agent_id=$AGENT_ID" >> $GITHUB_OUTPUT
         
-        # Create scan request for current repository
+        # Create scan request for current repository (use local path since repo is already checked out)
         SCAN_REQUEST=$(cat << EOF
         {
-          "repositoryUrl": "https://github.com/${{ github.repository }}.git",
+          "repositoryUrl": "file://${{ github.workspace }}",
           "branch": "${{ github.ref_name }}",
           "agentId": "$AGENT_ID"
         }
@@ -184,12 +223,23 @@ jobs:
           fi
           
           # Check scan status
-          SCAN_STATUS=$(curl -k -s https://localhost:44361/api/scans/requests/$SCAN_ID | node -e "
+          SCAN_RESPONSE=$(curl -k -s https://localhost:44361/api/scans/requests/$SCAN_ID)
+          echo "Scan response: $SCAN_RESPONSE"
+          
+          SCAN_STATUS=$(echo "$SCAN_RESPONSE" | node -e "
             const response = JSON.parse(require('fs').readFileSync('/dev/stdin', 'utf8'));
             console.log(response.status);
           ")
           
           echo "Scan status: $SCAN_STATUS (elapsed: ${ELAPSED}s)"
+          
+          # If scan failed, get more details
+          if [ "$SCAN_STATUS" = "Failed" ]; then
+            echo "Scan failed. Checking MCP server logs and agent status..."
+            echo "Checking if MCP server is still running:"
+            curl -k -s https://localhost:44361/api/agents || echo "MCP server not responding"
+            echo "Checking agent logs in the background..."
+          fi
           
           if [ "$SCAN_STATUS" = "Completed" ]; then
             echo "Scan completed successfully"
@@ -309,14 +359,32 @@ jobs:
     - name: Cleanup
       if: always()
       run: |
+        echo "=== CLEANUP AND DEBUG INFO ==="
+        
+        # Show final agent logs if available
+        if [ -f mcp-server/OWASPScannerAgent/agent.log ]; then
+          echo "=== Final Agent Logs ==="
+          tail -50 mcp-server/OWASPScannerAgent/agent.log || true
+        fi
+        
+        # Show temp directory contents
+        if [ -d mcp-server/OWASPScannerAgent/temp ]; then
+          echo "=== Temp Directory Contents ==="
+          ls -la mcp-server/OWASPScannerAgent/temp/ || true
+        fi
+        
         # Stop services
+        echo "=== Stopping Services ==="
         if [ -f mcp-server/mcp-server.pid ]; then
+          echo "Stopping MCP Server (PID: $(cat mcp-server/mcp-server.pid))"
           kill $(cat mcp-server/mcp-server.pid) || true
         fi
         if [ -f mcp-server/scanner-agent.pid ]; then
+          echo "Stopping Scanner Agent (PID: $(cat mcp-server/scanner-agent.pid))"
           kill $(cat mcp-server/scanner-agent.pid) || true
         fi
         
         # Clean up temp files
+        echo "=== Cleaning Up Temp Files ==="
         cd mcp-server/OWASPScannerAgent
         rm -rf temp/ || true 
