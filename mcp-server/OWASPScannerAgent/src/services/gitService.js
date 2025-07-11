@@ -28,8 +28,8 @@ const cloneRepository = async (repositoryUrl, branch = 'main', targetDir) => {
       // Create target directory
       await fs.promises.mkdir(targetDir, { recursive: true });
       
-      // Copy directory recursively
-      await copyDirectory(workspacePath, targetDir);
+      // Copy directory recursively (excluding mcp-server to prevent recursion)
+      await copyDirectory(workspacePath, targetDir, true);
       
       logger.info(`Successfully copied GitHub Actions repository from ${workspacePath} to ${targetDir}`);
       return;
@@ -49,7 +49,7 @@ const cloneRepository = async (repositoryUrl, branch = 'main', targetDir) => {
       await fs.promises.mkdir(targetDir, { recursive: true });
       
       // Copy directory recursively
-      await copyDirectory(localPath, targetDir);
+      await copyDirectory(localPath, targetDir, false);
       
       logger.info(`Successfully copied local repository from ${localPath} to ${targetDir}`);
       return;
@@ -86,8 +86,9 @@ const cloneRepository = async (repositoryUrl, branch = 'main', targetDir) => {
  * Copy directory recursively
  * @param {string} src - Source directory
  * @param {string} dest - Destination directory
+ * @param {boolean} isWorkspaceRoot - True if copying from GitHub workspace root
  */
-const copyDirectory = async (src, dest) => {
+const copyDirectory = async (src, dest, isWorkspaceRoot = false) => {
   const entries = await fs.promises.readdir(src, { withFileTypes: true });
   
   for (const entry of entries) {
@@ -100,8 +101,14 @@ const copyDirectory = async (src, dest) => {
         continue;
       }
       
+      // Skip mcp-server directory when copying from workspace root to prevent recursion
+      if (isWorkspaceRoot && entry.name === 'mcp-server') {
+        logger.info(`Skipping mcp-server directory to prevent recursion`);
+        continue;
+      }
+      
       await fs.promises.mkdir(destPath, { recursive: true });
-      await copyDirectory(srcPath, destPath);
+      await copyDirectory(srcPath, destPath, false); // Only first level is workspace root
     } else {
       await fs.promises.copyFile(srcPath, destPath);
     }
