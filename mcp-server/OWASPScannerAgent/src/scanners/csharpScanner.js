@@ -78,7 +78,8 @@ const analyzeCSharp = async (repoPath) => {
                 lineNumber,
                 description: result.extra.message,
                 codeSnippet,
-                recommendation: result.extra.metadata?.recommendation || 'Review the code for security issues.'
+                recommendation: result.extra.metadata?.recommendation || 'Review the code for security issues.',
+                scanner: 'csharp'
               });
             }
           }
@@ -280,7 +281,8 @@ const analyzeWithRegex = async (repoPath) => {
               lineNumber: 1,
               description: pattern.name,
               codeSnippet: lines.slice(0, Math.min(5, lines.length)).join('\n'),
-              recommendation: pattern.recommendation
+              recommendation: pattern.recommendation,
+              scanner: 'csharp'
             });
           }
         } else {
@@ -312,7 +314,8 @@ const analyzeWithRegex = async (repoPath) => {
               lineNumber,
               description: pattern.name,
               codeSnippet,
-              recommendation: pattern.recommendation
+              recommendation: pattern.recommendation,
+              scanner: 'csharp'
             });
           }
         }
