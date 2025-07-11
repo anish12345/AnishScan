@@ -14,6 +14,27 @@ const cloneRepository = async (repositoryUrl, branch = 'main', targetDir) => {
   try {
     logger.info(`Cloning repository ${repositoryUrl} (branch: ${branch}) to ${targetDir}`);
     
+    // Handle special GitHub Actions local repository case
+    if (repositoryUrl === 'local-github-actions-repo') {
+      // In GitHub Actions, the repository is checked out to the workspace
+      const workspacePath = process.env.GITHUB_WORKSPACE || process.cwd();
+      logger.info(`Detected GitHub Actions local repository, copying from ${workspacePath} to ${targetDir}`);
+      
+      // Check if source directory exists
+      if (!fs.existsSync(workspacePath)) {
+        throw new Error(`GitHub workspace path does not exist: ${workspacePath}`);
+      }
+      
+      // Create target directory
+      await fs.promises.mkdir(targetDir, { recursive: true });
+      
+      // Copy directory recursively
+      await copyDirectory(workspacePath, targetDir);
+      
+      logger.info(`Successfully copied GitHub Actions repository from ${workspacePath} to ${targetDir}`);
+      return;
+    }
+    
     // Handle local file:// URLs by copying instead of cloning
     if (repositoryUrl.startsWith('file://')) {
       const localPath = repositoryUrl.replace('file://', '').replace(/\//g, path.sep);

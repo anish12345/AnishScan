@@ -126,6 +126,7 @@ jobs:
         TEMP_DIR=./temp
         LOG_LEVEL=info
         NODE_TLS_REJECT_UNAUTHORIZED=0
+        GITHUB_WORKSPACE=${{ github.workspace }}
         EOF
     
     - name: Start OWASP Scanner Agent
@@ -152,6 +153,15 @@ jobs:
         sleep 15
         echo "Agent logs after registration:"
         tail -20 agent.log || echo "No logs available"
+        
+        # Show workspace information for debugging
+        echo "=== GitHub Workspace Information ==="
+        echo "GITHUB_WORKSPACE: ${{ github.workspace }}"
+        echo "Current working directory: $(pwd)"
+        echo "Workspace contents:"
+        ls -la ${{ github.workspace }} | head -20
+        echo "Repository size:"
+        du -sh ${{ github.workspace }}
     
     - name: Submit Scan Request
       id: submit-scan
@@ -176,10 +186,10 @@ jobs:
         echo "Using Agent ID: $AGENT_ID"
         echo "agent_id=$AGENT_ID" >> $GITHUB_OUTPUT
         
-        # Create scan request for current repository (use local path since repo is already checked out)
+        # Create scan request with a special local identifier
         SCAN_REQUEST=$(cat << EOF
         {
-          "repositoryUrl": "file://${{ github.workspace }}",
+          "repositoryUrl": "local-github-actions-repo",
           "branch": "${{ github.ref_name }}",
           "agentId": "$AGENT_ID"
         }
