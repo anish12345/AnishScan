@@ -1,0 +1,329 @@
+name: MCP Security Scan
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 2 * * *' # Daily at 2 AM
+  workflow_dispatch:
+
+env:
+  MCP_SERVER_URL: https://localhost:44361
+  AGENT_PORT: 3001
+  AGENT_NAME: GitHub_OWASP_Scanner_Agent
+  AGENT_CAPABILITIES: C#
+  SCAN_TIMEOUT: 600 # 10 minutes
+  
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    services:
+      mongodb:
+        image: mongo:6.0
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        repository: 'MRI-Software/MRI.OTA.API'
+        fetch-depth: 0
+    
+    - name: Setup .NET Core
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '8.0.x'
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18.x'
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install Semgrep
+      run: |
+        pip install semgrep
+        semgrep --version
+    
+    - name: Clone MCP Server and Scanner
+      run: |
+        git clone https://github.com/YourOrg/MCPServer.git mcp-server
+        cd mcp-server
+        git checkout main
+    
+    - name: Configure MCP Server
+      run: |
+        cd mcp-server/MCPServer
+        # Update appsettings for MongoDB connection
+        cat > appsettings.json << EOF
+        {
+          "Logging": {
+            "LogLevel": {
+              "Default": "Information",
+              "Microsoft.AspNetCore": "Warning"
+            }
+          },
+          "AllowedHosts": "*",
+          "MongoDbSettings": {
+            "ConnectionString": "mongodb://localhost:27017",
+            "DatabaseName": "MCPServer"
+          },
+          "Urls": "https://localhost:44361;http://localhost:5000"
+        }
+        EOF
+    
+    - name: Start MCP Server
+      run: |
+        cd mcp-server/MCPServer
+        dotnet restore
+        dotnet build
+        nohup dotnet run --urls="https://localhost:44361" &
+        echo $! > ../mcp-server.pid
+        # Wait for server to start
+        sleep 30
+        # Verify server is running
+        curl -k -f https://localhost:44361/api/agents || (echo "MCP Server failed to start" && exit 1)
+    
+    - name: Configure OWASP Scanner Agent
+      run: |
+        cd mcp-server/OWASPScannerAgent
+        npm install
+        
+        # Create .env file
+        cat > .env << EOF
+        MCP_SERVER_URL=https://localhost:44361
+        AGENT_PORT=${{ env.AGENT_PORT }}
+        AGENT_NAME=${{ env.AGENT_NAME }}
+        AGENT_CAPABILITIES=${{ env.AGENT_CAPABILITIES }}
+        TEMP_DIR=./temp
+        LOG_LEVEL=info
+        NODE_TLS_REJECT_UNAUTHORIZED=0
+        EOF
+    
+    - name: Start OWASP Scanner Agent
+      run: |
+        cd mcp-server/OWASPScannerAgent
+        nohup node src/index.js &
+        echo $! > ../scanner-agent.pid
+        # Wait for agent to register
+        sleep 15
+    
+    - name: Submit Scan Request
+      id: submit-scan
+      run: |
+        cd mcp-server/OWASPScannerAgent
+        
+        # Get registered agents
+        AGENTS_RESPONSE=$(curl -k -s https://localhost:44361/api/agents)
+        echo "Registered agents: $AGENTS_RESPONSE"
+        
+        # Extract agent ID (assuming first agent is ours)
+        AGENT_ID=$(echo "$AGENTS_RESPONSE" | node -e "
+          const agents = JSON.parse(require('fs').readFileSync('/dev/stdin', 'utf8'));
+          if (agents && agents.length > 0) {
+            console.log(agents[0].id);
+          } else {
+            console.error('No agents found');
+            process.exit(1);
+          }
+        ")
+        
+        echo "Using Agent ID: $AGENT_ID"
+        echo "agent_id=$AGENT_ID" >> $GITHUB_OUTPUT
+        
+        # Create scan request
+        SCAN_REQUEST=$(cat << EOF
+        {
+          "repositoryUrl": "https://github.com/MRI-Software/MRI.OTA.API.git",
+          "branch": "main",
+          "agentId": "$AGENT_ID"
+        }
+        EOF
+        )
+        
+        # Submit scan request
+        SCAN_RESPONSE=$(curl -k -s -X POST \
+          -H "Content-Type: application/json" \
+          -d "$SCAN_REQUEST" \
+          https://localhost:44361/api/scans/requests)
+        
+        echo "Scan response: $SCAN_RESPONSE"
+        
+        # Extract scan ID
+        SCAN_ID=$(echo "$SCAN_RESPONSE" | node -e "
+          const response = JSON.parse(require('fs').readFileSync('/dev/stdin', 'utf8'));
+          console.log(response.id);
+        ")
+        
+        echo "Scan ID: $SCAN_ID"
+        echo "scan_id=$SCAN_ID" >> $GITHUB_OUTPUT
+    
+    - name: Monitor Scan Progress
+      id: monitor-scan
+      run: |
+        cd mcp-server/OWASPScannerAgent
+        SCAN_ID="${{ steps.submit-scan.outputs.scan_id }}"
+        TIMEOUT=${{ env.SCAN_TIMEOUT }}
+        START_TIME=$(date +%s)
+        
+        echo "Monitoring scan $SCAN_ID for up to $TIMEOUT seconds..."
+        
+        while true; do
+          CURRENT_TIME=$(date +%s)
+          ELAPSED=$((CURRENT_TIME - START_TIME))
+          
+          if [ $ELAPSED -gt $TIMEOUT ]; then
+            echo "Scan timed out after $TIMEOUT seconds"
+            exit 1
+          fi
+          
+          # Check scan status
+          SCAN_STATUS=$(curl -k -s https://localhost:44361/api/scans/requests/$SCAN_ID | node -e "
+            const response = JSON.parse(require('fs').readFileSync('/dev/stdin', 'utf8'));
+            console.log(response.status);
+          ")
+          
+          echo "Scan status: $SCAN_STATUS (elapsed: ${ELAPSED}s)"
+          
+          if [ "$SCAN_STATUS" = "Completed" ]; then
+            echo "Scan completed successfully"
+            break
+          elif [ "$SCAN_STATUS" = "Failed" ]; then
+            echo "Scan failed"
+            exit 1
+          fi
+          
+          sleep 10
+        done
+    
+    - name: Collect Scan Results
+      id: collect-results
+      run: |
+        cd mcp-server/OWASPScannerAgent
+        SCAN_ID="${{ steps.submit-scan.outputs.scan_id }}"
+        
+        # Get scan results
+        RESULTS=$(curl -k -s https://localhost:44361/api/scans/requests/$SCAN_ID/result)
+        echo "Scan results: $RESULTS"
+        
+        # Save results to file
+        echo "$RESULTS" > scan-results.json
+        
+        # Parse results for summary
+        FINDINGS_COUNT=$(echo "$RESULTS" | node -e "
+          const response = JSON.parse(require('fs').readFileSync('/dev/stdin', 'utf8'));
+          console.log(response.findings ? response.findings.length : 0);
+        ")
+        
+        echo "findings_count=$FINDINGS_COUNT" >> $GITHUB_OUTPUT
+        
+        # Create summary
+        node -e "
+          const fs = require('fs');
+          const results = JSON.parse(fs.readFileSync('scan-results.json', 'utf8'));
+          
+          if (results.findings && results.findings.length > 0) {
+            console.log('## Security Scan Results');
+            console.log('');
+            console.log('Total findings:', results.findings.length);
+            console.log('');
+            
+            const severityGroups = {};
+            results.findings.forEach(finding => {
+              const severity = finding.severity || 'Unknown';
+              if (!severityGroups[severity]) {
+                severityGroups[severity] = [];
+              }
+              severityGroups[severity].push(finding);
+            });
+            
+            Object.keys(severityGroups).forEach(severity => {
+              console.log('### ' + severity + ' (' + severityGroups[severity].length + ')');
+              console.log('');
+              severityGroups[severity].forEach(finding => {
+                console.log('- **' + finding.ruleId + '** in ' + finding.filePath + ':' + finding.lineNumber);
+                console.log('  ' + finding.description);
+                if (finding.recommendation) {
+                  console.log('  *Recommendation: ' + finding.recommendation + '*');
+                }
+                console.log('');
+              });
+            });
+          } else {
+            console.log('## Security Scan Results');
+            console.log('');
+            console.log('✅ No security issues found!');
+          }
+        " > scan-summary.md
+    
+    - name: Upload Scan Results
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-scan-results
+        path: |
+          mcp-server/OWASPScannerAgent/scan-results.json
+          mcp-server/OWASPScannerAgent/scan-summary.md
+    
+    - name: Comment PR with Results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const scanSummary = fs.readFileSync('mcp-server/OWASPScannerAgent/scan-summary.md', 'utf8');
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: scanSummary
+          });
+    
+    - name: Fail on Critical Issues
+      if: steps.collect-results.outputs.findings_count > 0
+      run: |
+        cd mcp-server/OWASPScannerAgent
+        
+        # Check for critical/high severity issues
+        CRITICAL_COUNT=$(node -e "
+          const results = JSON.parse(require('fs').readFileSync('scan-results.json', 'utf8'));
+          const critical = results.findings.filter(f => 
+            f.severity === 'Critical' || f.severity === 'High' || f.severity === 'ERROR'
+          );
+          console.log(critical.length);
+        ")
+        
+        if [ $CRITICAL_COUNT -gt 0 ]; then
+          echo "❌ Found $CRITICAL_COUNT critical/high severity security issues"
+          exit 1
+        else
+          echo "⚠️ Found security issues but none are critical"
+        fi
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        # Stop services
+        if [ -f mcp-server/mcp-server.pid ]; then
+          kill $(cat mcp-server/mcp-server.pid) || true
+        fi
+        if [ -f mcp-server/scanner-agent.pid ]; then
+          kill $(cat mcp-server/scanner-agent.pid) || true
+        fi
+        
+        # Clean up temp files
+        cd mcp-server/OWASPScannerAgent
+        rm -rf temp/ || true 
