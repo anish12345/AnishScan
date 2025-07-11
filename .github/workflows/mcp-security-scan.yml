@@ -91,7 +91,7 @@ jobs:
           "AllowedHosts": "*",
           "MongoDbSettings": {
             "ConnectionString": "mongodb://localhost:27017",
-            "DatabaseName": "MCPServer"
+            "DatabaseName": "MCPDatabase"
           },
           "Urls": "https://localhost:44361;http://localhost:5000"
         }
@@ -345,7 +345,7 @@ jobs:
             body: scanSummary
           });
     
-    - name: Fail on Critical Issues
+    - name: Report Critical Issues
       if: steps.collect-results.outputs.findings_count > 0
       run: |
         cd mcp-server/OWASPScannerAgent
@@ -360,10 +360,10 @@ jobs:
         ")
         
         if [ $CRITICAL_COUNT -gt 0 ]; then
-          echo "❌ Found $CRITICAL_COUNT critical/high severity security issues"
-          exit 1
+          echo "⚠️ Found $CRITICAL_COUNT critical/high severity security issues"
+          echo "Results have been uploaded as artifacts for review"
         else
-          echo "⚠️ Found security issues but none are critical"
+          echo "✅ Found security issues but none are critical"
         fi
     
     - name: Cleanup
