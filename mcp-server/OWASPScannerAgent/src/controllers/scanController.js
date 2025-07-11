@@ -18,6 +18,14 @@ const handleScanRequest = async (scanRequest) => {
   const tempDir = path.join(process.env.TEMP_DIR || './temp', `scan-${scanId}`);
   
   logger.info(`Processing scan request ${scanId} for repository ${repositoryUrl}`);
+  console.log(`=== SCAN ${scanId} STARTING ===`);
+  console.log(`Repository URL: ${repositoryUrl}`);
+  console.log(`Branch: ${branch}`);
+  console.log(`Temp Directory: ${tempDir}`);
+  console.log(`Environment variables:`);
+  console.log(`- GITHUB_WORKSPACE: ${process.env.GITHUB_WORKSPACE || 'not set'}`);
+  console.log(`- TEMP_DIR: ${process.env.TEMP_DIR || 'not set'}`);
+  console.log(`- Current working directory: ${process.cwd()}`);
   
   try {
     // Update agent status
@@ -25,28 +33,58 @@ const handleScanRequest = async (scanRequest) => {
     
     // Clone the repository
     logger.info(`Cloning repository ${repositoryUrl} (branch: ${branch}) to ${tempDir}`);
+    console.log(`=== STEP 1: Cloning repository ===`);
     await cloneRepository(repositoryUrl, branch, tempDir);
+    console.log(`✅ Repository cloned successfully to ${tempDir}`);
+    
+    // Check what was copied
+    console.log(`=== STEP 2: Verifying repository copy ===`);
+    if (fs.existsSync(tempDir)) {
+      const files = fs.readdirSync(tempDir);
+      console.log(`✅ Temp directory exists with ${files.length} items`);
+      console.log(`Top-level contents: ${files.slice(0, 10).join(', ')}${files.length > 10 ? '...' : ''}`);
+      
+      // Check for common project files
+      const projectFiles = files.filter(f => 
+        f.endsWith('.sln') || f.endsWith('.csproj') || f === 'package.json' || f === 'angular.json'
+      );
+      console.log(`Project files found: ${projectFiles.join(', ') || 'none'}`);
+    } else {
+      throw new Error(`Temp directory ${tempDir} does not exist after cloning`);
+    }
     
     // Analyze the code
     logger.info('Starting code analysis');
+    console.log(`=== STEP 3: Starting code analysis ===`);
     const findings = await analyzeCode(tempDir);
+    console.log(`✅ Code analysis completed with ${findings.length} findings`);
     
     // Generate summary
+    console.log(`=== STEP 4: Generating summary ===`);
     const summary = generateSummary(findings);
+    console.log(`✅ Summary generated`);
     
     // Submit results back to MCP
     logger.info(`Submitting scan results for scan ${scanId}`);
+    console.log(`=== STEP 5: Submitting results ===`);
     await submitResults(scanId, findings, summary);
+    console.log(`✅ Results submitted successfully`);
     
     // Cleanup
+    console.log(`=== STEP 6: Cleanup ===`);
     await cleanupRepository(tempDir);
+    console.log(`✅ Cleanup completed`);
     
     // Update agent status
     global.agentStatus = 'Idle';
     
     logger.info(`Scan ${scanId} completed successfully`);
+    console.log(`=== SCAN ${scanId} COMPLETED SUCCESSFULLY ===`);
   } catch (error) {
     logger.error(`Error processing scan ${scanId}:`, error.message);
+    console.error(`=== SCAN ${scanId} FAILED ===`);
+    console.error(`Error: ${error.message}`);
+    console.error(`Stack trace: ${error.stack}`);
     
     // Update agent status
     global.agentStatus = 'Error';
@@ -54,8 +92,10 @@ const handleScanRequest = async (scanRequest) => {
     // Try to clean up even if there was an error
     try {
       await cleanupRepository(tempDir);
+      console.log(`✅ Cleanup completed after error`);
     } catch (cleanupError) {
       logger.error('Error during cleanup:', cleanupError.message);
+      console.error(`❌ Cleanup failed: ${cleanupError.message}`);
     }
     
     throw error;
