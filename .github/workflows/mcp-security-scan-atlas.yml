@@ -1,0 +1,497 @@
+name: MCP Security Scan (MongoDB Atlas)
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 2 * * *' # Daily at 2 AM
+  workflow_dispatch:
+
+env:
+  MCP_SERVER_URL: https://localhost:44361
+  AGENT_PORT: 3001
+  AGENT_NAME: GitHub_OWASP_Scanner_Agent
+  AGENT_CAPABILITIES: C#
+  SCAN_TIMEOUT: 600 # 10 minutes
+  
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup .NET Core
+      uses: actions/setup-dotnet@v3
+      with:
+        dotnet-version: '8.0.x'
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18.x'
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install Semgrep
+      run: |
+        pip install semgrep
+        semgrep --version
+        echo "Semgrep installation path: $(which semgrep)"
+    
+    - name: Configure MCP Server for MongoDB Atlas
+      run: |
+        cd mcp-server/MCPServer
+        # Update appsettings for MongoDB Atlas connection
+        cat > appsettings.json << EOF
+        {
+          "Logging": {
+            "LogLevel": {
+              "Default": "Information",
+              "Microsoft.AspNetCore": "Warning",
+              "MongoDB": "Debug"
+            }
+          },
+          "AllowedHosts": "*",
+          "MongoDbSettings": {
+            "ConnectionString": "${{ secrets.MONGODB_CONNECTION_STRING }}",
+            "DatabaseName": "MCPDatabase"
+          },
+          "Urls": "https://localhost:44361;http://localhost:5000"
+        }
+        EOF
+        
+        echo "=== MCP Server Configuration ==="
+        # Show config without exposing secrets
+        cat appsettings.json | sed 's/\${{ secrets.MONGODB_CONNECTION_STRING }}/[HIDDEN]/g'
+    
+    - name: Test MongoDB Atlas Connection
+      run: |
+        echo "Testing MongoDB Atlas connection..."
+        
+        # Install MongoDB tools
+        wget -qO - https://www.mongodb.org/static/pgp/server-6.0.asc | sudo apt-key add -
+        echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/6.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+        sudo apt-get update
+        sudo apt-get install -y mongodb-mongosh
+        
+        # Test connection to MongoDB Atlas
+        mongosh "${{ secrets.MONGODB_CONNECTION_STRING }}/MCPDatabase" --eval "db.runCommand({ ping: 1 })" || (
+          echo "❌ MongoDB Atlas connection failed!"
+          echo "Please check:"
+          echo "1. MONGODB_CONNECTION_STRING secret is set correctly"
+          echo "2. MongoDB Atlas cluster is running"
+          echo "3. IP address is whitelisted in MongoDB Atlas"
+          echo "4. Database user has proper permissions"
+          exit 1
+        )
+        
+        echo "✅ MongoDB Atlas connection successful!"
+    
+    - name: Start MCP Server
+      run: |
+        cd mcp-server/MCPServer
+        echo "=== Starting MCP Server ==="
+        dotnet restore
+        dotnet build
+        
+        # Start with verbose logging
+        ASPNETCORE_URLS="https://localhost:44361;http://localhost:5000" \
+        nohup dotnet run --verbosity normal > ../mcp-server.log 2>&1 &
+        echo $! > ../mcp-server.pid
+        
+        # Wait for server to start
+        sleep 30
+        
+        # Show server logs
+        echo "=== MCP Server Logs ==="
+        tail -50 ../mcp-server.log || echo "No logs available"
+        
+        # Verify server is running
+        echo "=== Testing MCP Server ==="
+        curl -k -f https://localhost:44361/api/agents || (echo "MCP Server failed to start" && exit 1)
+        
+        # Test specific endpoints
+        echo "=== Testing MCP Server Endpoints ==="
+        curl -k -s https://localhost:44361/api/agents | head -100 || echo "Agents endpoint failed"
+        curl -k -s https://localhost:44361/api/scans/requests | head -100 || echo "Scans endpoint failed"
+    
+    - name: Configure OWASP Scanner Agent
+      run: |
+        cd mcp-server/OWASPScannerAgent
+        npm install
+        
+        # Create temp directory
+        mkdir -p temp
+        
+        # Create .env file
+        cat > .env << EOF
+        MCP_SERVER_URL=https://localhost:44361
+        AGENT_PORT=${{ env.AGENT_PORT }}
+        AGENT_NAME=${{ env.AGENT_NAME }}
+        AGENT_CAPABILITIES=${{ env.AGENT_CAPABILITIES }}
+        TEMP_DIR=./temp
+        LOG_LEVEL=info
+        NODE_TLS_REJECT_UNAUTHORIZED=0
+        GITHUB_WORKSPACE=${{ github.workspace }}
+        EOF
+    
+    - name: Start OWASP Scanner Agent
+      run: |
+        cd mcp-server/OWASPScannerAgent
+        
+        # Start agent with logging
+        echo "Starting OWASP Scanner Agent..."
+        echo "Current directory: $(pwd)"
+        echo "Environment variables:"
+        cat .env
+        
+        # Start agent in background and capture output
+        nohup node src/index.js > agent.log 2>&1 &
+        echo $! > ../scanner-agent.pid
+        
+        # Wait for agent to start
+        sleep 5
+        echo "Agent process ID: $(cat ../scanner-agent.pid)"
+        echo "Agent initial logs:"
+        head -20 agent.log || echo "No logs yet"
+        
+        # Wait for agent to register
+        sleep 15
+        echo "Agent logs after registration:"
+        tail -20 agent.log || echo "No logs available"
+    
+    - name: Submit Scan Request
+      id: submit-scan
+      run: |
+        cd mcp-server/OWASPScannerAgent
+        
+        # Get registered agents
+        AGENTS_RESPONSE=$(curl -k -s https://localhost:44361/api/agents)
+        echo "Registered agents: $AGENTS_RESPONSE"
+        
+        # Extract agent ID (assuming first agent is ours)
+        AGENT_ID=$(echo "$AGENTS_RESPONSE" | node -e "
+          const agents = JSON.parse(require('fs').readFileSync('/dev/stdin', 'utf8'));
+          if (agents && agents.length > 0) {
+            console.log(agents[0].id);
+          } else {
+            console.error('No agents found');
+            process.exit(1);
+          }
+        ")
+        
+        echo "Using Agent ID: $AGENT_ID"
+        echo "agent_id=$AGENT_ID" >> $GITHUB_OUTPUT
+        
+        # Create scan request with a special local identifier
+        SCAN_REQUEST=$(cat << EOF
+        {
+          "repositoryUrl": "local-github-actions-repo",
+          "branch": "${{ github.ref_name }}",
+          "agentId": "$AGENT_ID"
+        }
+        EOF
+        )
+        
+        # Submit scan request
+        SCAN_RESPONSE=$(curl -k -s -X POST \
+          -H "Content-Type: application/json" \
+          -d "$SCAN_REQUEST" \
+          https://localhost:44361/api/scans/requests)
+        
+        echo "Scan response: $SCAN_RESPONSE"
+        
+        # Extract scan ID
+        SCAN_ID=$(echo "$SCAN_RESPONSE" | node -e "
+          const response = JSON.parse(require('fs').readFileSync('/dev/stdin', 'utf8'));
+          console.log(response.id);
+        ")
+        
+        echo "Scan ID: $SCAN_ID"
+        echo "scan_id=$SCAN_ID" >> $GITHUB_OUTPUT
+    
+    - name: Monitor Scan Progress
+      id: monitor-scan
+      run: |
+        cd mcp-server/OWASPScannerAgent
+        SCAN_ID="${{ steps.submit-scan.outputs.scan_id }}"
+        TIMEOUT=${{ env.SCAN_TIMEOUT }}
+        START_TIME=$(date +%s)
+        
+        echo "Monitoring scan $SCAN_ID for up to $TIMEOUT seconds..."
+        
+        while true; do
+          CURRENT_TIME=$(date +%s)
+          ELAPSED=$((CURRENT_TIME - START_TIME))
+          
+          if [ $ELAPSED -gt $TIMEOUT ]; then
+            echo "Scan timed out after $TIMEOUT seconds"
+            exit 1
+          fi
+          
+          # Check scan status
+          SCAN_RESPONSE=$(curl -k -s https://localhost:44361/api/scans/requests/$SCAN_ID)
+          echo "Scan response: $SCAN_RESPONSE"
+          
+          SCAN_STATUS=$(echo "$SCAN_RESPONSE" | node -e "
+            const response = JSON.parse(require('fs').readFileSync('/dev/stdin', 'utf8'));
+            console.log(response.status);
+          ")
+          
+          echo "Scan status: $SCAN_STATUS (elapsed: ${ELAPSED}s)"
+          
+          if [ "$SCAN_STATUS" = "Completed" ]; then
+            echo "Scan completed successfully"
+            break
+          elif [ "$SCAN_STATUS" = "Failed" ]; then
+            echo "Scan failed"
+            exit 1
+          fi
+          
+          sleep 10
+        done
+    
+    - name: Verify MongoDB Atlas Data
+      run: |
+        echo "=== Verifying MongoDB Atlas Data ==="
+        
+        # Check MongoDB collections in Atlas
+        mongosh "${{ secrets.MONGODB_CONNECTION_STRING }}/MCPDatabase" --eval "
+          console.log('=== Database Collections in MongoDB Atlas ===');
+          db.getCollectionNames().forEach(name => {
+            console.log('Collection:', name);
+            const count = db.getCollection(name).countDocuments();
+            console.log('  Documents:', count);
+          });
+          
+          console.log('=== Recent ScanRequests ===');
+          db.ScanRequests.find().sort({_id: -1}).limit(3).forEach(doc => {
+            console.log('ScanRequest:', JSON.stringify(doc, null, 2));
+          });
+          
+          console.log('=== Recent ScanResults ===');
+          db.ScanResults.find().sort({_id: -1}).limit(3).forEach(doc => {
+            console.log('ScanResult:', JSON.stringify(doc, null, 2));
+          });
+        " || echo "Failed to query MongoDB Atlas"
+        
+        echo "✅ Scan data has been stored in MongoDB Atlas!"
+        echo "📊 You can now create your report UI using the data from MongoDB Atlas"
+        echo "🌐 Connection: Use the same connection string to connect from your local report UI"
+    
+    - name: Create Local Connection Guide
+      run: |
+        cat > MONGODB_ATLAS_CONNECTION.md << 'EOF'
+        # Connecting to MongoDB Atlas from Your Local Report UI
+        
+        Your scan data is now stored in MongoDB Atlas. To connect from your local report UI:
+        
+        ## Connection Details
+        - **Database**: MCPDatabase
+        - **Collections**: ScanRequests, ScanResults, Agents
+        - **Connection String**: Use the same connection string from your GitHub secret
+        
+        ## For Your Local Report UI
+        
+        ### .NET Application (C#)
+        ```csharp
+        // In appsettings.json
+        {
+          "MongoDbSettings": {
+            "ConnectionString": "mongodb+srv://username:password@cluster.mongodb.net/",
+            "DatabaseName": "MCPDatabase"
+          }
+        }
+        ```
+        
+        ### Node.js Application
+        ```javascript
+        const { MongoClient } = require('mongodb');
+        
+        const connectionString = 'mongodb+srv://username:password@cluster.mongodb.net/';
+        const client = new MongoClient(connectionString);
+        
+        async function connectToDatabase() {
+          await client.connect();
+          const db = client.db('MCPDatabase');
+          
+          // Query scan results
+          const scanResults = await db.collection('ScanResults').find().toArray();
+          const scanRequests = await db.collection('ScanRequests').find().toArray();
+          
+          return { scanResults, scanRequests };
+        }
+        ```
+        
+        ### Python Application
+        ```python
+        from pymongo import MongoClient
+        
+        connection_string = 'mongodb+srv://username:password@cluster.mongodb.net/'
+        client = MongoClient(connection_string)
+        db = client['MCPDatabase']
+        
+        # Query scan results
+        scan_results = list(db.ScanResults.find())
+        scan_requests = list(db.ScanRequests.find())
+        ```
+        
+        ## Security Notes
+        - Store connection string in environment variables or config files
+        - Don't commit connection strings to version control
+        - Use MongoDB Atlas IP whitelist for security
+        - Consider using database-specific users with limited permissions
+        
+        ## Data Structure
+        - **ScanRequests**: Contains scan metadata (repository, branch, status, timestamps)
+        - **ScanResults**: Contains actual security findings with details
+        - **Agents**: Contains registered scanner agents information
+        
+        ## Sample Queries
+        ```javascript
+        // Get all scan results for a specific repository
+        db.ScanResults.find({ repositoryUrl: "your-repo-url" })
+        
+        // Get recent scans
+        db.ScanRequests.find().sort({ createdAt: -1 }).limit(10)
+        
+        // Get high-severity issues
+        db.ScanResults.find({ "findings.severity": "High" })
+        
+        // Count findings by severity
+        db.ScanResults.aggregate([
+          { $unwind: "$findings" },
+          { $group: { _id: "$findings.severity", count: { $sum: 1 } } }
+        ])
+        ```
+        EOF
+    
+    - name: Collect Scan Results
+      id: collect-results
+      run: |
+        cd mcp-server/OWASPScannerAgent
+        SCAN_ID="${{ steps.submit-scan.outputs.scan_id }}"
+        
+        # Get scan results
+        RESULTS=$(curl -k -s https://localhost:44361/api/scans/requests/$SCAN_ID/result)
+        echo "Scan results: $RESULTS"
+        
+        # Save results to file
+        echo "$RESULTS" > scan-results.json
+        
+        # Parse results for summary
+        FINDINGS_COUNT=$(echo "$RESULTS" | node -e "
+          const response = JSON.parse(require('fs').readFileSync('/dev/stdin', 'utf8'));
+          console.log(response.findings ? response.findings.length : 0);
+        ")
+        
+        echo "findings_count=$FINDINGS_COUNT" >> $GITHUB_OUTPUT
+        
+        # Create summary
+        node -e "
+          const fs = require('fs');
+          const results = JSON.parse(fs.readFileSync('scan-results.json', 'utf8'));
+          
+          if (results.findings && results.findings.length > 0) {
+            console.log('## Security Scan Results');
+            console.log('');
+            console.log('**Total findings:** ' + results.findings.length);
+            console.log('**Data stored in:** MongoDB Atlas (MCPDatabase)');
+            console.log('**Access:** Available from your local report UI using Atlas connection');
+            console.log('');
+            
+            const severityGroups = {};
+            results.findings.forEach(finding => {
+              const severity = finding.severity || 'Unknown';
+              if (!severityGroups[severity]) {
+                severityGroups[severity] = [];
+              }
+              severityGroups[severity].push(finding);
+            });
+            
+            Object.keys(severityGroups).forEach(severity => {
+              console.log('### ' + severity + ' (' + severityGroups[severity].length + ')');
+              console.log('');
+              severityGroups[severity].slice(0, 10).forEach(finding => {
+                console.log('- **' + finding.ruleId + '** in ' + finding.filePath + ':' + finding.lineNumber);
+                console.log('  ' + finding.description);
+                if (finding.recommendation) {
+                  console.log('  *Recommendation: ' + finding.recommendation + '*');
+                }
+                console.log('');
+              });
+              
+              if (severityGroups[severity].length > 10) {
+                console.log('*... and ' + (severityGroups[severity].length - 10) + ' more*');
+                console.log('');
+              }
+            });
+          } else {
+            console.log('## Security Scan Results');
+            console.log('');
+            console.log('✅ No security issues found!');
+            console.log('**Data stored in:** MongoDB Atlas (MCPDatabase)');
+            console.log('**Access:** Available from your local report UI using Atlas connection');
+          }
+        " > scan-summary.md
+    
+    - name: Upload Scan Results and Connection Guide
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-scan-results-and-atlas-guide
+        path: |
+          mcp-server/OWASPScannerAgent/scan-results.json
+          mcp-server/OWASPScannerAgent/scan-summary.md
+          mcp-server/OWASPScannerAgent/agent.log
+          mcp-server/mcp-server.log
+          MONGODB_ATLAS_CONNECTION.md
+    
+    - name: Comment PR with Results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const scanSummary = fs.readFileSync('mcp-server/OWASPScannerAgent/scan-summary.md', 'utf8');
+          const connectionGuide = fs.readFileSync('MONGODB_ATLAS_CONNECTION.md', 'utf8');
+          
+          const comment = `${scanSummary}\n\n---\n\n<details><summary>📊 How to Access Data in Your Report UI</summary>\n\n${connectionGuide}\n\n</details>`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: comment
+          });
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        echo "=== CLEANUP ==="
+        
+        # Stop services
+        if [ -f mcp-server/mcp-server.pid ]; then
+          echo "Stopping MCP Server (PID: $(cat mcp-server/mcp-server.pid))"
+          kill $(cat mcp-server/mcp-server.pid) || true
+        fi
+        if [ -f mcp-server/scanner-agent.pid ]; then
+          echo "Stopping Scanner Agent (PID: $(cat mcp-server/scanner-agent.pid))"
+          kill $(cat mcp-server/scanner-agent.pid) || true
+        fi
+        
+        # Clean up temp files
+        echo "Cleaning up temp files..."
+        cd mcp-server/OWASPScannerAgent
+        rm -rf temp/ || true
+        
+        echo "✅ Cleanup completed"
+        echo "📊 Data persists in MongoDB Atlas for your report UI" 

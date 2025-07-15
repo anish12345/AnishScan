@@ -75,36 +75,17 @@ jobs:
         which npm || echo "npm not found"
         which dotnet || echo "dotnet not found"
         which semgrep || echo "semgrep not found"
-        echo "MongoDB connectivity test:"
-        curl -f mongodb://localhost:27017 || echo "MongoDB not accessible via curl"
-        nc -z localhost 27017 && echo "MongoDB port 27017 is open" || echo "MongoDB port 27017 is closed"
-    
-    - name: Test MongoDB Connection
-      run: |
-        echo "Testing MongoDB connection..."
-        # Install MongoDB client tools
-        wget -qO - https://www.mongodb.org/static/pgp/server-6.0.asc | sudo apt-key add -
-        echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu focal/mongodb-org/6.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-6.0.list
-        sudo apt-get update
-        sudo apt-get install -y mongodb-mongosh
-        
-        # Test connection
-        mongosh --host localhost:27017 --eval "db.runCommand({ ping: 1 })" || echo "MongoDB connection failed"
-        
-        # Test with different connection strings
-        mongosh "mongodb://localhost:27017/test" --eval "db.runCommand({ ping: 1 })" || echo "MongoDB connection with database failed"
     
     - name: Configure MCP Server
       run: |
         cd mcp-server/MCPServer
-        # Update appsettings for MongoDB connection with the correct connection string for GitHub Actions
+        # Update appsettings for MongoDB connection
         cat > appsettings.json << EOF
         {
           "Logging": {
             "LogLevel": {
               "Default": "Information",
-              "Microsoft.AspNetCore": "Warning",
-              "MongoDB": "Debug"
+              "Microsoft.AspNetCore": "Warning"
             }
           },
           "AllowedHosts": "*",
@@ -115,37 +96,18 @@ jobs:
           "Urls": "https://localhost:44361;http://localhost:5000"
         }
         EOF
-        
-        echo "=== MCP Server Configuration ==="
-        cat appsettings.json
     
     - name: Start MCP Server
       run: |
         cd mcp-server/MCPServer
-        echo "=== Starting MCP Server ==="
         dotnet restore
         dotnet build
-        
-        # Start with verbose logging
-        ASPNETCORE_URLS="https://localhost:44361;http://localhost:5000" \
-        nohup dotnet run --verbosity normal > ../mcp-server.log 2>&1 &
+        nohup dotnet run --urls="https://localhost:44361" &
         echo $! > ../mcp-server.pid
-        
         # Wait for server to start
         sleep 30
-        
-        # Show server logs
-        echo "=== MCP Server Logs ==="
-        tail -50 ../mcp-server.log || echo "No logs available"
-        
         # Verify server is running
-        echo "=== Testing MCP Server ==="
         curl -k -f https://localhost:44361/api/agents || (echo "MCP Server failed to start" && exit 1)
-        
-        # Test specific endpoints
-        echo "=== Testing MCP Server Endpoints ==="
-        curl -k -s https://localhost:44361/api/agents | head -100 || echo "Agents endpoint failed"
-        curl -k -s https://localhost:44361/api/scans/requests | head -100 || echo "Scans endpoint failed"
     
     - name: Configure OWASP Scanner Agent
       run: |
@@ -287,10 +249,6 @@ jobs:
             echo "Checking if MCP server is still running:"
             curl -k -s https://localhost:44361/api/agents || echo "MCP server not responding"
             echo "Checking agent logs in the background..."
-            echo "=== Latest Agent Logs ==="
-            tail -30 agent.log || echo "No agent logs available"
-            echo "=== Latest MCP Server Logs ==="
-            tail -30 ../mcp-server.log || echo "No MCP server logs available"
           fi
           
           if [ "$SCAN_STATUS" = "Completed" ]; then
@@ -303,140 +261,6 @@ jobs:
           
           sleep 10
         done
-    
-    - name: Export MongoDB Data for Local Import
-      run: |
-        echo "=== Exporting MongoDB Data for Local Import ==="
-        
-        # Create export directory
-        mkdir -p mongodb-export
-        
-        # Export ScanRequests collection
-        echo "Exporting ScanRequests collection..."
-        mongosh "mongodb://localhost:27017/MCPDatabase" --eval "
-          db.ScanRequests.find().forEach(function(doc) {
-            print(JSON.stringify(doc));
-          });
-        " > mongodb-export/ScanRequests.json || echo "Failed to export ScanRequests"
-        
-        # Export ScanResults collection
-        echo "Exporting ScanResults collection..."
-        mongosh "mongodb://localhost:27017/MCPDatabase" --eval "
-          db.ScanResults.find().forEach(function(doc) {
-            print(JSON.stringify(doc));
-          });
-        " > mongodb-export/ScanResults.json || echo "Failed to export ScanResults"
-        
-        # Export Agents collection
-        echo "Exporting Agents collection..."
-        mongosh "mongodb://localhost:27017/MCPDatabase" --eval "
-          db.Agents.find().forEach(function(doc) {
-            print(JSON.stringify(doc));
-          });
-        " > mongodb-export/Agents.json || echo "Failed to export Agents"
-        
-        # Create import script for local use
-        cat > mongodb-export/import-to-local.js << 'EOF'
-        // MongoDB Import Script for Local Database
-        // Run this script in your local MongoDB instance
-        
-        // Connect to local MCPDatabase
-        use MCPDatabase
-        
-        print("=== Importing scan data to local MongoDB ===");
-        
-        // Note: You'll need to manually import the JSON files
-        // Use the following commands in your local MongoDB:
-        // mongoimport --db MCPDatabase --collection ScanRequests --file ScanRequests.json
-        // mongoimport --db MCPDatabase --collection ScanResults --file ScanResults.json  
-        // mongoimport --db MCPDatabase --collection Agents --file Agents.json
-        
-        print("Import completed. Check your local MCPDatabase for the imported data.");
-        EOF
-        
-        # Create PowerShell import script for Windows
-        cat > mongodb-export/import-to-local.ps1 << 'EOF'
-        # PowerShell script to import MongoDB data to local instance
-        Write-Host "=== Importing MongoDB data to local instance ==="
-        
-        # Check if MongoDB tools are available
-        $mongoImport = Get-Command mongoimport -ErrorAction SilentlyContinue
-        if (-not $mongoImport) {
-            Write-Error "mongoimport not found. Please install MongoDB Database Tools"
-            exit 1
-        }
-        
-        # Import collections
-        Write-Host "Importing ScanRequests..."
-        mongoimport --db MCPDatabase --collection ScanRequests --file ScanRequests.json --jsonArray
-        
-        Write-Host "Importing ScanResults..."
-        mongoimport --db MCPDatabase --collection ScanResults --file ScanResults.json --jsonArray
-        
-        Write-Host "Importing Agents..."
-        mongoimport --db MCPDatabase --collection Agents --file Agents.json --jsonArray
-        
-        Write-Host "Import completed successfully!"
-        EOF
-        
-        # Create bash import script for Linux/Mac
-        cat > mongodb-export/import-to-local.sh << 'EOF'
-        #!/bin/bash
-        # Bash script to import MongoDB data to local instance
-        echo "=== Importing MongoDB data to local instance ==="
-        
-        # Check if MongoDB tools are available
-        if ! command -v mongoimport &> /dev/null; then
-            echo "mongoimport not found. Please install MongoDB Database Tools"
-            exit 1
-        fi
-        
-        # Import collections
-        echo "Importing ScanRequests..."
-        mongoimport --db MCPDatabase --collection ScanRequests --file ScanRequests.json --jsonArray
-        
-        echo "Importing ScanResults..."
-        mongoimport --db MCPDatabase --collection ScanResults --file ScanResults.json --jsonArray
-        
-        echo "Importing Agents..."
-        mongoimport --db MCPDatabase --collection Agents --file Agents.json --jsonArray
-        
-        echo "Import completed successfully!"
-        EOF
-        
-        chmod +x mongodb-export/import-to-local.sh
-        
-        # Show what was exported
-        echo "=== Exported Files ==="
-        ls -la mongodb-export/
-        echo "=== Export Summary ==="
-        echo "ScanRequests: $(wc -l < mongodb-export/ScanRequests.json || echo 0) records"
-        echo "ScanResults: $(wc -l < mongodb-export/ScanResults.json || echo 0) records"  
-        echo "Agents: $(wc -l < mongodb-export/Agents.json || echo 0) records"
-    
-    - name: Verify Database Content
-      run: |
-        echo "=== Verifying Database Content ==="
-        
-        # Check MongoDB collections
-        mongosh "mongodb://localhost:27017/MCPDatabase" --eval "
-          console.log('=== Database Collections ===');
-          db.getCollectionNames().forEach(name => {
-            console.log('Collection:', name);
-            const count = db.getCollection(name).countDocuments();
-            console.log('  Documents:', count);
-          });
-          
-          console.log('=== ScanRequests Collection ===');
-          db.ScanRequests.find().limit(5).forEach(doc => {
-            console.log('ScanRequest:', JSON.stringify(doc, null, 2));
-          });
-          
-          console.log('=== ScanResults Collection ===');
-          db.ScanResults.find().limit(5).forEach(doc => {
-            console.log('ScanResult:', JSON.stringify(doc, null, 2));
-          });
-        " || echo "Failed to query database"
     
     - name: Collect Scan Results
       id: collect-results
@@ -498,78 +322,13 @@ jobs:
           }
         " > scan-summary.md
     
-    - name: Create Local Import Instructions
-      run: |
-        cat > LOCAL_IMPORT_INSTRUCTIONS.md << 'EOF'
-        # How to Import Scan Results to Your Local MongoDB
-        
-        The scan results from this GitHub Actions workflow are stored in a temporary MongoDB container. To import them into your local MongoDB database, follow these steps:
-        
-        ## Prerequisites
-        - MongoDB installed locally
-        - MongoDB Database Tools installed (for mongoimport command)
-        
-        ## Steps
-        
-        1. **Download the MongoDB export files** from the GitHub Actions artifacts
-        2. **Extract the files** to a folder on your local machine
-        3. **Run the import script** for your operating system:
-        
-        ### For Windows (PowerShell):    ```powershell
-        .\import-to-local.ps1
-    ```        
-        ### For Linux/Mac (Bash):    ```bash
-        ./import-to-local.sh
-    ```        
-        ### Manual Import (if scripts don't work):    ```bash
-    # Import ScanRequests
-    mongoimport --db MCPDatabase --collection ScanRequests --file ScanRequests.json --jsonArray
-    
-    # Import ScanResults 
-    mongoimport --db MCPDatabase --collection ScanResults --file ScanResults.json --jsonArray
-    
-    # Import Agents
-    mongoimport --db MCPDatabase --collection Agents --file Agents.json --jsonArray
-    ```        
-        ## Verification
-        
-        After importing, you can verify the data in your local MongoDB:
-            ```javascript
-    // Connect to your local MongoDB
-    use MCPDatabase
-    
-    // Check collections
-    show collections
-    
-    // Count documents
-    db.ScanRequests.countDocuments()
-    db.ScanResults.countDocuments()
-    db.Agents.countDocuments()
-    
-    // View sample data
-    db.ScanResults.findOne()
-    ```        
-        ## Troubleshooting
-        
-        - If mongoimport is not found, install MongoDB Database Tools
-        - If import fails, check that your local MongoDB is running
-        - If collections already exist, you may need to drop them first:      ```javascript
-          db.ScanRequests.drop()
-          db.ScanResults.drop()
-          db.Agents.drop()
-      ```        EOF
-    
-    - name: Upload Scan Results and MongoDB Export
+    - name: Upload Scan Results
       uses: actions/upload-artifact@v4
       with:
-        name: security-scan-results-and-mongodb-export
+        name: security-scan-results
         path: |
           mcp-server/OWASPScannerAgent/scan-results.json
           mcp-server/OWASPScannerAgent/scan-summary.md
-          mcp-server/OWASPScannerAgent/agent.log
-          mcp-server/mcp-server.log
-          mongodb-export/
-          LOCAL_IMPORT_INSTRUCTIONS.md
     
     - name: Comment PR with Results
       if: github.event_name == 'pull_request'
@@ -578,15 +337,12 @@ jobs:
         script: |
           const fs = require('fs');
           const scanSummary = fs.readFileSync('mcp-server/OWASPScannerAgent/scan-summary.md', 'utf8');
-          const importInstructions = fs.readFileSync('LOCAL_IMPORT_INSTRUCTIONS.md', 'utf8');
-          
-          const fullComment = `${scanSummary}\n\n---\n\n${importInstructions}`;
           
           github.rest.issues.createComment({
             issue_number: context.issue.number,
             owner: context.repo.owner,
             repo: context.repo.repo,
-            body: fullComment
+            body: scanSummary
           });
     
     - name: Report Critical Issues
@@ -606,10 +362,8 @@ jobs:
         if [ $CRITICAL_COUNT -gt 0 ]; then
           echo "⚠️ Found $CRITICAL_COUNT critical/high severity security issues"
           echo "Results have been uploaded as artifacts for review"
-          echo "📥 Download the 'security-scan-results-and-mongodb-export' artifact to import data to your local MongoDB"
         else
           echo "✅ Found security issues but none are critical"
-          echo "📥 Download the 'security-scan-results-and-mongodb-export' artifact to import data to your local MongoDB"
         fi
     
     - name: Cleanup
@@ -623,26 +377,11 @@ jobs:
           tail -50 mcp-server/OWASPScannerAgent/agent.log || true
         fi
         
-        # Show final MCP server logs if available
-        if [ -f mcp-server/mcp-server.log ]; then
-          echo "=== Final MCP Server Logs ==="
-          tail -50 mcp-server/mcp-server.log || true
-        fi
-        
         # Show temp directory contents
         if [ -d mcp-server/OWASPScannerAgent/temp ]; then
           echo "=== Temp Directory Contents ==="
           ls -la mcp-server/OWASPScannerAgent/temp/ || true
         fi
-        
-        # Final database check
-        echo "=== Final Database Check ==="
-        mongosh "mongodb://localhost:27017/MCPDatabase" --eval "
-          console.log('Final collection counts:');
-          db.getCollectionNames().forEach(name => {
-            console.log(name + ':', db.getCollection(name).countDocuments());
-          });
-        " || echo "Database check failed"
         
         # Stop services
         echo "=== Stopping Services ==="
@@ -658,4 +397,4 @@ jobs:
         # Clean up temp files
         echo "=== Cleaning Up Temp Files ==="
         cd mcp-server/OWASPScannerAgent
-        rm -rf temp/ || true
+        rm -rf temp/ || true 
